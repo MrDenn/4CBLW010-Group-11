@@ -1,0 +1,1 @@
+Directory for **Week 4** SSAs of all group members, a.k.a. **SSA4** assignment submissions

@@ -1,0 +1,1 @@
+Directory for **Week 2** SSAs of all group members, a.k.a. **SSA2** assignment submissions
