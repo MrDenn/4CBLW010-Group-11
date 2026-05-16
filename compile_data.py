@@ -95,8 +95,41 @@ def _read_villegas_csv(path: Path) -> pd.DataFrame | None:
     return pd.read_csv(path, header=None, names=["wn", "y"], skiprows=skip)
 
 
+# Map verbose / variant OpenSpecy SpectrumIdentity strings to our big-6
+# acronyms. Anything not in this map is dropped by the downstream
+# TARGET_CLASSES filter. Generic "Polyethylene" without an HDPE/LDPE
+# distinction is intentionally absent (same call as FLOPP's generic "PE").
+# Modified PE variants (waxes, chlorinated, oxidized, foamed) are also
+# absent because they aren't pristine polymer.
+_OPENSPECY_LABEL_MAP = {
+    "hdpe":                          "HDPE",
+    "ldpe":                          "LDPE",
+    "pet":                           "PET",
+    "pete":                          "PET",
+    "polyethylene terephthalate":    "PET",
+    "polytehylene terephthalate":    "PET",  # OpenSpecy typo
+    "polyethylene terephtalate":     "PET",  # OpenSpecy typo
+    "pp":                            "PP",
+    "polypropylene":                 "PP",
+    "polypropylene isotactic":       "PP",
+    "fibre polypropylene":           "PP",
+    "ps":                            "PS",
+    "polystyrene":                   "PS",
+    "polystyrene expanded":          "PS",
+    "pvc":                           "PVC",
+    "polyvinylchloride":             "PVC",
+    "polyvinyl chloride":            "PVC",
+    "poly(vinyl chloride)":          "PVC",
+}
+
+
+def _normalize_openspecy_label(raw: str) -> str | None:
+    """Return the big-6 short form, or None if the spectrum should be dropped."""
+    return _OPENSPECY_LABEL_MAP.get(raw.strip().lower())
+
+
 def load_openspecy(directory: str) -> list[dict]:
-    """OpenSpecy FTIR library.
+    """OpenSpecy FTIR library, filtered to ATR-mode + big-6 polymers.
 
     Two CSVs are shipped together:
       - OpenSpecy_FTIR_library.csv: long-format (Wavelength, Intensity,
@@ -104,13 +137,17 @@ def load_openspecy(directory: str) -> list[dict]:
       - OpenSpecy_FTIR_library_metadata.csv: one row per SampleName with
         SpectrumIdentity (polymer label), InstrumentMode (ATR/transmission/
         DRIFTS/reflection - heterogeneous), SpectrumType, etc.
+
+    Two filters applied here so the OpenSpecy contribution is comparable
+    to the other ATR sources:
+      1. InstrumentMode must start with "ATR" (drops transmission, DRIFTS,
+         reflection, and NaN-mode entries).
+      2. SpectrumIdentity must normalize to one of the big-6 polymers.
     """
     root = Path(directory)
     long_df = pd.read_csv(root / "OpenSpecy_FTIR_library.csv")
     meta = pd.read_csv(root / "OpenSpecy_FTIR_library_metadata.csv")
 
-    # All entries here are SpectrumType == "FTIR" by construction of the file,
-    # but assert it so we notice if the upstream layout ever changes.
     if "SpectrumType" in meta.columns:
         meta = meta[meta["SpectrumType"].astype(str).str.upper() == "FTIR"]
 
@@ -123,13 +160,19 @@ def load_openspecy(directory: str) -> list[dict]:
         if sid not in meta_by_sample.index:
             continue
         m = meta_by_sample.loc[sid]
-        if isinstance(m, pd.DataFrame):  # duplicate metadata rows -> take first
+        if isinstance(m, pd.DataFrame):
             m = m.iloc[0]
 
-        grp = grp.sort_values("Wavelength")
-        polymer_raw = str(m.get("SpectrumIdentity", "UNKNOWN")).strip() or "UNKNOWN"
         mode = m.get("InstrumentMode", None)
-        mode = None if (pd.isna(mode) or str(mode).strip() == "") else str(mode).strip()
+        mode_str = "" if (pd.isna(mode) or str(mode).strip() == "") else str(mode).strip()
+        if not mode_str.upper().startswith("ATR"):
+            continue
+
+        polymer_class = _normalize_openspecy_label(str(m.get("SpectrumIdentity", "")))
+        if polymer_class is None:
+            continue
+
+        grp = grp.sort_values("Wavelength")
 
         # SpectralResolution is a free-text field (e.g. "4/cm", "8 cm-1"); parse
         # the first number if possible, else leave None.
@@ -144,13 +187,12 @@ def load_openspecy(directory: str) -> list[dict]:
             "spectrum_id":       f"OS_{sid}",
             "source":            "OpenSpecy",
             "sample_id":         str(sid),
-            "polymer_class_raw": polymer_raw,
+            "polymer_class_raw": polymer_class,
             "wn":                grp["Wavelength"].to_numpy(dtype=np.float32),
             "intensity":         grp["Intensity"].to_numpy(dtype=np.float32),
-            # Already min-max normalized to [0,1] per spectrum in the upstream file.
             "intensity_type":    "normalized",
             "resolution_cm":     res_val,
-            "instrument_mode":   mode,
+            "instrument_mode":   mode_str,
         })
     return records
 
@@ -185,7 +227,7 @@ def resample(wn_native, y_native):
     return f(canonical_wn).astype(np.float32)
 
 
-all_records = flopp + flopp_e + vc_c4# + os_recs
+all_records = flopp + flopp_e + vc_c4 + os_recs
 
 rows = []
 for r in all_records:
