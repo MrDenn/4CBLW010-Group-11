@@ -159,6 +159,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--embedder-run", required=True)
     p.add_argument("--checkpoint", default="best.pt")
     p.add_argument("--unknown-class", required=True, choices=POLYMER_CLASSES)
+    p.add_argument("--split-mode", choices=("random", "source_out"), default="random")
     p.add_argument("--alpha", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -167,7 +168,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = get_device()
-    splits = prepare_splits(seed=args.seed)
+    splits = prepare_splits(seed=args.seed, mode=args.split_mode)
     df = load_parquet()
 
     # The held-out class becomes the unknown stream, drawn from ALL of
@@ -181,9 +182,10 @@ def main() -> None:
     unknown_df   = df[unknown_mask]
 
     ckpt = Path(RUNS_DIR) / args.embedder_run / args.checkpoint
+    test_ids = [s for s, sp in splits.items() if sp.startswith("test")]
     ds_train = SpectrumDataset(known_df, [s for s, sp in splits.items() if sp == "train"])
     ds_calib = SpectrumDataset(known_df, [s for s, sp in splits.items() if sp == "calib"])
-    ds_test  = SpectrumDataset(known_df, [s for s, sp in splits.items() if sp == "test"])
+    ds_test  = SpectrumDataset(known_df, test_ids)
     ds_unknown = SpectrumDataset(unknown_df, unknown_df["spectrum_id"].tolist())
 
     E_train, y_train = embed_split(ckpt, ds_train, device)

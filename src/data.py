@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 import numpy as np
 import pandas as pd
@@ -34,9 +34,14 @@ from src.config import (
     PAD_RIGHT,
     PARQUET_PATH,
     POLYMER_CLASSES,
-    SPLITS_PATH,
+    SOURCE_OUT_TEST,
+    SOURCE_OUT_TRAIN,
+    splits_path,
 )
 from src.utils import read_json, write_json
+
+
+SplitMode = Literal["random", "source_out"]
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +79,32 @@ def derive_physical_sample_id(df: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 
-def make_splits(df: pd.DataFrame, seed: int) -> dict[str, str]:
-    """Four-way sample-level split: train / val / calib / test.
+def make_splits(df: pd.DataFrame, seed: int, mode: SplitMode) -> dict[str, str]:
+    """Sample-level split assignment keyed by `spectrum_id`.
 
-    Implemented as three sequential `StratifiedGroupKFold` peels (10, 9, 8
-    splits) so that each peel removes ~10% of the *total* dataset while
-    keeping every physical sample on exactly one side of every boundary.
+    Two modes:
+      - "random":     train / val / calib / test, all stratified by class
+                      and grouped by physical_sample_id within the full
+                      dataset. Best-case in-distribution score.
+      - "source_out": train / val / calib carved out of SOURCE_OUT_TRAIN
+                      sources only; one held-out test split per source in
+                      SOURCE_OUT_TEST (e.g. test_floppe-e, test_openspecy)
+                      so per-source generalization is measurable.
     """
+    if mode == "random":
+        assignment = _make_splits_random(df, seed)
+    elif mode == "source_out":
+        assignment = _make_splits_source_out(df, seed)
+    else:
+        raise ValueError(f"Unknown split mode: {mode!r}")
+    _assert_no_group_leakage(df, assignment)
+    return assignment
+
+
+def _make_splits_random(df: pd.DataFrame, seed: int) -> dict[str, str]:
+    """Three sequential StratifiedGroupKFold peels (10, 9, 8 splits) so
+    each peel removes ~10% of the dataset while keeping every physical
+    sample on one side of every boundary."""
     y = df["polymer_class_raw"].to_numpy()
     g = df["physical_sample_id"].to_numpy()
     idx_all = np.arange(len(df))
@@ -94,18 +118,48 @@ def make_splits(df: pd.DataFrame, seed: int) -> dict[str, str]:
     val_idx = _peel(remaining, y[remaining], g[remaining], n_splits=8, seed=seed + 2)
     train_idx = np.setdiff1d(remaining, val_idx, assume_unique=False)
 
-    assignment: dict[str, str] = {}
-    for sid, split in [
-        (df["spectrum_id"].iloc[train_idx], "train"),
-        (df["spectrum_id"].iloc[val_idx],   "val"),
-        (df["spectrum_id"].iloc[calib_idx], "calib"),
-        (df["spectrum_id"].iloc[test_idx],  "test"),
-    ]:
-        for s in sid:
-            assignment[s] = split
+    return _build_assignment(df, [
+        (train_idx, "train"),
+        (val_idx,   "val"),
+        (calib_idx, "calib"),
+        (test_idx,  "test"),
+    ])
 
-    _assert_no_group_leakage(df, assignment)
-    return assignment
+
+def _make_splits_source_out(df: pd.DataFrame, seed: int) -> dict[str, str]:
+    """Carve val/calib out of SOURCE_OUT_TRAIN; hold each SOURCE_OUT_TEST
+    source as its own labeled test split (e.g. test_FLOPP-e, test_OpenSpecy)
+    so per-source domain shift can be reported separately."""
+    train_pool_mask = df["source"].isin(SOURCE_OUT_TRAIN).to_numpy()
+    train_pool_df = df[train_pool_mask]
+    if train_pool_df.empty:
+        raise ValueError(
+            f"No spectra found for any source in SOURCE_OUT_TRAIN={SOURCE_OUT_TRAIN}. "
+            f"Available sources: {sorted(df['source'].unique())}"
+        )
+
+    pool_idx_global = np.where(train_pool_mask)[0]
+    y_pool = train_pool_df["polymer_class_raw"].to_numpy()
+    g_pool = train_pool_df["physical_sample_id"].to_numpy()
+    pool_idx_local = np.arange(len(train_pool_df))
+
+    calib_local = _peel(pool_idx_local, y_pool, g_pool, n_splits=10, seed=seed)
+    rem_after_calib = np.setdiff1d(pool_idx_local, calib_local, assume_unique=False)
+    val_local = _peel(rem_after_calib, y_pool[rem_after_calib], g_pool[rem_after_calib], n_splits=9, seed=seed + 1)
+    train_local = np.setdiff1d(rem_after_calib, val_local, assume_unique=False)
+
+    pieces: list[tuple[np.ndarray, str]] = [
+        (pool_idx_global[train_local], "train"),
+        (pool_idx_global[val_local],   "val"),
+        (pool_idx_global[calib_local], "calib"),
+    ]
+    for src in SOURCE_OUT_TEST:
+        src_idx = np.where(df["source"].to_numpy() == src)[0]
+        if src_idx.size == 0:
+            continue
+        pieces.append((src_idx, f"test_{src}"))
+
+    return _build_assignment(df, pieces)
 
 
 def _peel(idx: np.ndarray, y: np.ndarray, g: np.ndarray, n_splits: int, seed: int) -> np.ndarray:
@@ -116,24 +170,38 @@ def _peel(idx: np.ndarray, y: np.ndarray, g: np.ndarray, n_splits: int, seed: in
     return idx[local_held]
 
 
+def _build_assignment(df: pd.DataFrame, pieces: list[tuple[np.ndarray, str]]) -> dict[str, str]:
+    assignment: dict[str, str] = {}
+    for indices, split in pieces:
+        for s in df["spectrum_id"].iloc[indices]:
+            assignment[s] = split
+    return assignment
+
+
 def _assert_no_group_leakage(df: pd.DataFrame, assignment: dict[str, str]) -> None:
-    by_split: dict[str, set[str]] = {"train": set(), "val": set(), "calib": set(), "test": set()}
+    """Every physical sample must appear in at most one split."""
+    by_split: dict[str, set[str]] = {}
     for _, row in df.iterrows():
-        by_split[assignment[row["spectrum_id"]]].add(row["physical_sample_id"])
+        sp = assignment.get(row["spectrum_id"])
+        if sp is None:
+            continue
+        by_split.setdefault(sp, set()).add(row["physical_sample_id"])
     splits = list(by_split)
     for i, a in enumerate(splits):
         for b in splits[i + 1:]:
             overlap = by_split[a] & by_split[b]
             if overlap:
-                raise AssertionError(f"physical_sample_id leakage between {a!r} and {b!r}: {sorted(overlap)[:5]}")
+                raise AssertionError(
+                    f"physical_sample_id leakage between {a!r} and {b!r}: {sorted(overlap)[:5]}"
+                )
 
 
-def save_splits(assignment: dict[str, str], path: Path | str = SPLITS_PATH) -> None:
-    write_json(Path(path), assignment)
+def save_splits(assignment: dict[str, str], mode: SplitMode) -> None:
+    write_json(splits_path(mode), assignment)
 
 
-def load_splits(path: Path | str = SPLITS_PATH) -> dict[str, str]:
-    return read_json(Path(path))
+def load_splits(mode: SplitMode) -> dict[str, str]:
+    return read_json(splits_path(mode))
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +334,17 @@ def build_eval_loader(
 # ---------------------------------------------------------------------------
 
 
-def prepare_splits(seed: int, force: bool = False) -> dict[str, str]:
-    """Compute (or reload) the persistent train/val/calib/test assignment.
+def prepare_splits(seed: int, mode: SplitMode = "random", force: bool = False) -> dict[str, str]:
+    """Compute (or reload) the persistent split assignment for a given mode.
 
-    The assignment is persisted to disk so that repeated runs draw from
-    the same partition; pass `force=True` to recompute.
+    Each mode persists to its own JSON file (splits_random.json /
+    splits_source_out.json), so switching modes does not clobber the
+    other's assignment. Pass `force=True` to recompute.
     """
-    if SPLITS_PATH.exists() and not force:
-        return load_splits()
+    path = splits_path(mode)
+    if path.exists() and not force:
+        return load_splits(mode)
     df = load_parquet()
-    assignment = make_splits(df, seed=seed)
-    save_splits(assignment)
+    assignment = make_splits(df, seed=seed, mode=mode)
+    save_splits(assignment, mode)
     return assignment

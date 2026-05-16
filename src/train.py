@@ -162,6 +162,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--loss", choices=("multisim", "triplet"), default="multisim")
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--split-mode", choices=("random", "source_out"), default="random",
+                   help="random: stratified-group split across all sources. "
+                        "source_out: train on Villegas+FLOPP, test on FLOPP-e and OpenSpecy.")
     p.add_argument("--refresh-splits", action="store_true", help="Recompute split assignment")
     return p.parse_args()
 
@@ -177,7 +180,7 @@ def main() -> None:
     write_json(run_dir / "config.json", vars(args) | {"device": str(device)})
 
     # Data
-    splits = prepare_splits(seed=args.seed, force=args.refresh_splits)
+    splits = prepare_splits(seed=args.seed, mode=args.split_mode, force=args.refresh_splits)
     df = load_parquet()
     train_ids = [s for s, sp in splits.items() if sp == "train"]
     val_ids   = [s for s, sp in splits.items() if sp == "val"]
@@ -199,7 +202,7 @@ def main() -> None:
     best_epoch = 0
     epochs_since_best = 0
 
-    print(f"[run {run_name}] device={device} | train={len(train_ds)} val={len(val_ds)} | loss={args.loss}")
+    print(f"[run {run_name}] device={device} | mode={args.split_mode} | train={len(train_ds)} val={len(val_ds)} | loss={args.loss}")
     if device.type == "cuda":
         # Confirm the model + a sample batch actually land on the GPU.
         _x, _y = next(iter(train_loader))

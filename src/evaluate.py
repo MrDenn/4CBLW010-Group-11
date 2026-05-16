@@ -157,43 +157,71 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--embedder-run", required=True, help="Run name under runs/ for the embedder")
     p.add_argument("--classifier-run", default=None, help="Optional run name for the CE classifier baseline")
     p.add_argument("--checkpoint", default="best.pt", help="Filename inside the run dir (default best.pt)")
+    p.add_argument("--split-mode", choices=("random", "source_out"), default="random",
+                   help="Must match the split mode the embedder was trained with.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
+
+
+def _test_split_names(splits: dict[str, str]) -> list[str]:
+    """All split names that begin with `test` (random -> ['test'];
+    source_out -> ['test_FLOPP-e', 'test_OpenSpecy'])."""
+    return sorted({sp for sp in splits.values() if sp.startswith("test")})
 
 
 def main() -> None:
     args = parse_args()
     device = get_device()
 
-    splits = prepare_splits(seed=args.seed)
+    splits = prepare_splits(seed=args.seed, mode=args.split_mode)
     df = load_parquet()
-    ds = {
+    test_splits = _test_split_names(splits)
+    if not test_splits:
+        raise RuntimeError(f"No test splits found in mode={args.split_mode!r}. Splits seen: {set(splits.values())}")
+
+    ds: dict[str, SpectrumDataset] = {
         "train": SpectrumDataset(df, [s for s, sp in splits.items() if sp == "train"]),
-        "test":  SpectrumDataset(df, [s for s, sp in splits.items() if sp == "test"]),
     }
+    for tsp in test_splits:
+        ds[tsp] = SpectrumDataset(df, [s for s, sp in splits.items() if sp == tsp])
 
-    # Raw-spectrum baseline.
-    raw = {split: raw_features(ds[split]) for split in ("train", "test")}
-    rows = score_zoo(raw, label="raw spectra", seed=args.seed)
-
-    # Embedder feature space.
+    # Embedder feature space (computed once for all test splits).
     ckpt = Path(RUNS_DIR) / args.embedder_run / args.checkpoint
     emb = embedded_features(ckpt, ds, device)
-    rows += score_zoo(emb, label="SLE-MultiSim embeddings", seed=args.seed)
+    raw = {split: raw_features(ds[split]) for split in ds}
 
-    if args.classifier_run is not None:
-        clf_ckpt = Path(RUNS_DIR) / args.classifier_run / args.checkpoint
-        rows.append(score_classifier_head(clf_ckpt, ds["test"], device))
+    rows: list[dict[str, float | str]] = []
+    for tsp in test_splits:
+        # Raw-spectrum baseline on this test split.
+        raw_pair = {"train": raw["train"], "test": raw[tsp]}
+        for r in score_zoo(raw_pair, label=f"raw spectra ({tsp})", seed=args.seed):
+            rows.append(r)
+        # Embedder feature space on this test split.
+        emb_pair = {"train": emb["train"], "test": emb[tsp]}
+        for r in score_zoo(emb_pair, label=f"SLE-MultiSim embeddings ({tsp})", seed=args.seed):
+            rows.append(r)
+        # Classifier head, if provided.
+        if args.classifier_run is not None:
+            clf_ckpt = Path(RUNS_DIR) / args.classifier_run / args.checkpoint
+            r = score_classifier_head(clf_ckpt, ds[tsp], device)
+            r["feature_space"] = f"raw (CNN classifier, {tsp})"
+            rows.append(r)
 
-    print(f"\n{'feature_space':<28} {'classifier':<22} {'acc':>6}   {'macro_f1':>8}")
-    print("-" * 70)
+    print(f"\n{'feature_space':<46} {'classifier':<22} {'acc':>6}   {'macro_f1':>8}")
+    print("-" * 88)
     for r in rows:
-        print(f"{r['feature_space']:<28} {r['classifier']:<22} {r['test_acc']:>6.4f}   {r['test_macro_f1']:>8.4f}")
+        print(f"{r['feature_space']:<46} {r['classifier']:<22} {r['test_acc']:>6.4f}   {r['test_macro_f1']:>8.4f}")
     print()
     print(f"Class index map: {dict(IDX_TO_CLASS)}")
 
-    out_path = Path(RUNS_DIR) / args.embedder_run / "evaluation.json"
-    write_json(out_path, {"rows": rows, "embedder_run": args.embedder_run, "classifier_run": args.classifier_run})
+    out_path = Path(RUNS_DIR) / args.embedder_run / f"evaluation_{args.split_mode}.json"
+    write_json(out_path, {
+        "rows":           rows,
+        "embedder_run":   args.embedder_run,
+        "classifier_run": args.classifier_run,
+        "split_mode":     args.split_mode,
+        "test_splits":    test_splits,
+    })
     print(f"Results written to {out_path}")
 
 

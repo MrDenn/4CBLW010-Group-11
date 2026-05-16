@@ -86,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--split-mode", choices=("random", "source_out"), default="random")
     p.add_argument("--refresh-splits", action="store_true")
     return p.parse_args()
 
@@ -100,7 +101,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "config.json", vars(args) | {"device": str(device), "model": "SmolenCNNClassifier"})
 
-    splits = prepare_splits(seed=args.seed, force=args.refresh_splits)
+    splits = prepare_splits(seed=args.seed, mode=args.split_mode, force=args.refresh_splits)
     df = load_parquet()
     train_ds = SpectrumDataset(df, [s for s, sp in splits.items() if sp == "train"])
     val_ds   = SpectrumDataset(df, [s for s, sp in splits.items() if sp == "val"])

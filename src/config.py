@@ -11,8 +11,21 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR     = PROJECT_ROOT / "data"
 PARQUET_PATH = DATA_DIR / "processed" / "all_spectra.parquet"
-SPLITS_PATH  = DATA_DIR / "processed" / "splits.json"
+SPLITS_DIR   = DATA_DIR / "processed"
 RUNS_DIR     = PROJECT_ROOT / "runs"
+
+
+def splits_path(mode: str) -> Path:
+    """Path to the persisted split assignment for a given splitting mode."""
+    return SPLITS_DIR / f"splits_{mode}.json"
+
+
+# Source-out split: which sources go into the train pool vs. into the
+# held-out test set. The point is to evaluate on data the model never
+# saw at the *source* level, so cross-instrument generalization is
+# measurable rather than masked by random in-source splits.
+SOURCE_OUT_TRAIN: tuple[str, ...] = ("Villegas-c4", "FLOPP")
+SOURCE_OUT_TEST:  tuple[str, ...] = ("FLOPP-e", "OpenSpecy")
 
 # Class vocabulary. Fixed alphabetical order so that label indices are
 # stable across runs and saved checkpoints remain compatible.
