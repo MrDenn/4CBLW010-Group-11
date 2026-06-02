@@ -43,6 +43,12 @@ INPUT_LEN_PADDED = 896
 PAD_LEFT         = (INPUT_LEN_PADDED - INPUT_LEN_RAW) // 2  # 7
 PAD_RIGHT        = INPUT_LEN_PADDED - INPUT_LEN_RAW - PAD_LEFT  # 7
 
+# Endpoints of the canonical wavenumber grid (cm-1). compile_data.py
+# resamples every training spectrum onto np.linspace(LO, HI, INPUT_LEN_RAW);
+# inference must use the identical grid.
+CANONICAL_LO = 700.0
+CANONICAL_HI = 3996.0
+
 # Smolen Fig. 1A architecture.
 EMBED_DIM     = 24
 CONV_CHANNELS = (1, 32, 64, 64, 64)   # (in, out1, out2, out3, out4)

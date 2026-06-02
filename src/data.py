@@ -205,6 +205,43 @@ def load_splits(mode: SplitMode) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Preprocessing (shared by training and inference)
+# ---------------------------------------------------------------------------
+
+
+def preprocess_spectra(intensities: np.ndarray) -> torch.Tensor:
+    """Min/max-normalize per spectrum, zero-pad 882 -> 896, add channel dim.
+
+    Input  (N, 882) array of resampled absorbance.
+    Output (N, 1, 896) float tensor ready for SmolenCNN.
+
+    This is the single source of truth for the model's input transform.
+    Both `SpectrumDataset` (training) and `predict.py` (inference) call
+    it, so an externally measured spectrum is treated bit-for-bit the
+    same way a training spectrum is.
+    """
+    intensities = np.asarray(intensities, dtype=np.float32)
+    if intensities.ndim != 2 or intensities.shape[1] != INPUT_LEN_RAW:
+        raise ValueError(f"Expected (N, {INPUT_LEN_RAW}) array, got {intensities.shape}")
+
+    # Per-spectrum min/max normalize to [0, 1].
+    lo = intensities.min(axis=1, keepdims=True)
+    hi = intensities.max(axis=1, keepdims=True)
+    intensities = (intensities - lo) / (hi - lo + 1e-8)
+
+    # Zero-pad 882 -> 896 so the valid-padded conv stack ends at the
+    # Smolen-published 52*64 flatten size.
+    intensities = np.pad(
+        intensities,
+        ((0, 0), (PAD_LEFT, PAD_RIGHT)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    # Add channel dim for Conv1d: (N, 1, 896).
+    return torch.from_numpy(intensities[:, None, :]).contiguous()
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -224,27 +261,7 @@ class SpectrumDataset(Dataset):
             raise ValueError("SpectrumDataset received an empty split")
 
         intensities = np.stack(view["intensity"].to_numpy()).astype(np.float32)
-        if intensities.shape[1] != INPUT_LEN_RAW:
-            raise ValueError(
-                f"Expected {INPUT_LEN_RAW}-channel spectra, got {intensities.shape[1]}"
-            )
-
-        # Per-spectrum min/max normalize to [0, 1].
-        lo = intensities.min(axis=1, keepdims=True)
-        hi = intensities.max(axis=1, keepdims=True)
-        intensities = (intensities - lo) / (hi - lo + 1e-8)
-
-        # Zero-pad 882 -> 896 so the valid-padded conv stack ends at the
-        # Smolen-published 52*64 flatten size.
-        intensities = np.pad(
-            intensities,
-            ((0, 0), (PAD_LEFT, PAD_RIGHT)),
-            mode="constant",
-            constant_values=0.0,
-        )
-
-        # Add channel dim for Conv1d: (N, 1, 896).
-        self.X = torch.from_numpy(intensities[:, None, :]).contiguous()
+        self.X = preprocess_spectra(intensities)
         self.y = torch.tensor(
             [CLASS_TO_IDX[c] for c in view["polymer_class_raw"]], dtype=torch.long
         )

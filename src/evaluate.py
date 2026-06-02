@@ -34,6 +34,12 @@ from src.data import (
 from src.model import SmolenCNN, SmolenCNNClassifier
 from src.train import embed_all
 from src.utils import get_device, load_checkpoint, write_json
+from src.viz import (
+    compute_projection,
+    save_confusion_grid,
+    save_confusion_matrix,
+    save_embedding_map,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +220,8 @@ def main() -> None:
     print()
     print(f"Class index map: {dict(IDX_TO_CLASS)}")
 
-    out_path = Path(RUNS_DIR) / args.embedder_run / f"evaluation_{args.split_mode}.json"
+    out_dir = Path(RUNS_DIR) / args.embedder_run
+    out_path = out_dir / f"evaluation_{args.split_mode}.json"
     write_json(out_path, {
         "rows":           rows,
         "embedder_run":   args.embedder_run,
@@ -223,6 +230,64 @@ def main() -> None:
         "test_splits":    test_splits,
     })
     print(f"Results written to {out_path}")
+
+    # --- figures: confusion matrix + embedding map per test split ---------
+    # Predictions for the figures come from k-NN (k=5) on the embeddings,
+    # i.e. the canonical Smolen inference path - the same mechanism
+    # predict.py uses, so these plots are directly comparable to the
+    # real-world-samples figures.
+    E_train, y_train = emb["train"]
+    knn = KNeighborsClassifier(n_neighbors=5, metric="minkowski", p=2)
+    knn.fit(E_train, y_train)
+
+    fig_dir = out_dir / f"figures_{args.split_mode}"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    panels: list[tuple[str, list[int], list[int]]] = []
+    for tsp in test_splits:
+        E_t, y_t = emb[tsp]
+        y_pred_t = knn.predict(E_t)
+        nice = tsp.replace("test_", "")
+
+        save_confusion_matrix(
+            list(y_t), list(y_pred_t), fig_dir / f"confusion_{nice}.png",
+            title=f"Confusion matrix - {nice}\n"
+                  f"accuracy = {accuracy_score(y_t, y_pred_t):.1%}  (n = {len(y_t)})",
+        )
+        G2, X2 = compute_projection(E_train, E_t, k=5)
+        save_embedding_map(
+            G2, X2, y_train, list(y_t), list(y_pred_t),
+            fig_dir / f"embedding_map_{nice}.png",
+            title=f"{nice} test set in the model's embedding space",
+            sample_label=f"{nice} spectrum",
+        )
+        panels.append((nice, list(y_t), list(y_pred_t)))
+
+    # Combined view: all held-out test sources pooled into one confusion
+    # matrix and one embedding map. Only meaningful with >1 test source.
+    if len(test_splits) > 1:
+        E_all = np.concatenate([emb[t][0] for t in test_splits])
+        y_all = np.concatenate([emb[t][1] for t in test_splits])
+        y_pred_all = knn.predict(E_all)
+
+        save_confusion_matrix(
+            list(y_all), list(y_pred_all), fig_dir / "confusion_combined.png",
+            title=f"Confusion matrix - all held-out test sources\n"
+                  f"accuracy = {accuracy_score(y_all, y_pred_all):.1%}  (n = {len(y_all)})",
+        )
+        G2c, X2c = compute_projection(E_train, E_all, k=5)
+        save_embedding_map(
+            G2c, X2c, y_train, list(y_all), list(y_pred_all),
+            fig_dir / "embedding_map_combined.png",
+            title="All held-out test sources in the model's embedding space",
+            sample_label="test spectrum",
+        )
+        panels.append(("all test sources", list(y_all), list(y_pred_all)))
+
+    save_confusion_grid(
+        panels, fig_dir / "confusion_matrices.png",
+        suptitle="Held-out test sets - k-NN on SLE-MultiSim embeddings",
+    )
+    print(f"Figures written to {fig_dir}")
 
 
 if __name__ == "__main__":
