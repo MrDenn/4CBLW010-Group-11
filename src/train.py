@@ -23,7 +23,7 @@ from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from torch import nn
 
-from src.config import DEFAULT_SEED, RUNS_DIR
+from src.config import AUG, DEFAULT_SEED, RUNS_DIR
 from src.data import (
     SpectrumDataset,
     build_eval_loader,
@@ -166,6 +166,11 @@ def parse_args() -> argparse.Namespace:
                    help="random: stratified-group split across all sources. "
                         "source_out: train on Villegas+FLOPP, test on FLOPP-e and OpenSpecy.")
     p.add_argument("--refresh-splits", action="store_true", help="Recompute split assignment")
+    aug = p.add_mutually_exclusive_group()
+    aug.add_argument("--aug", dest="aug", action="store_true", default=None,
+                     help="Enable physics-based augmentation on the train split (overrides config.AUG['enabled']).")
+    aug.add_argument("--no-aug", dest="aug", action="store_false",
+                     help="Disable augmentation (overrides config.AUG['enabled']). Use for the A/B baseline.")
     return p.parse_args()
 
 
@@ -174,21 +179,28 @@ def main() -> None:
     set_seeds(args.seed)
     device = get_device()
 
+    # Augmentation: CLI flag overrides the config default.
+    use_aug = AUG["enabled"] if args.aug is None else args.aug
+
     run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    write_json(run_dir / "config.json", vars(args) | {"device": str(device)})
+    write_json(run_dir / "config.json", vars(args) | {"device": str(device), "use_aug": use_aug, "aug": AUG if use_aug else None})
 
     # Data
     splits = prepare_splits(seed=args.seed, mode=args.split_mode, force=args.refresh_splits)
     df = load_parquet()
     train_ids = [s for s, sp in splits.items() if sp == "train"]
     val_ids   = [s for s, sp in splits.items() if sp == "val"]
-    train_ds = SpectrumDataset(df, train_ids)
-    val_ds   = SpectrumDataset(df, val_ids)
+    # train_ds is augmented (training only); gallery_ds is a clean view of the
+    # same train spectra used to embed the k-NN gallery / val-F1 reference, so
+    # the class prototypes are never distorted by augmentation.
+    train_ds   = SpectrumDataset(df, train_ids, augment=use_aug, aug_seed=args.seed)
+    gallery_ds = SpectrumDataset(df, train_ids, augment=False)
+    val_ds     = SpectrumDataset(df, val_ids, augment=False)
 
     train_loader     = build_train_loader_pairmining(train_ds, batch_size=args.batch_size, m=args.m, num_workers=args.num_workers)
-    train_ref_loader = build_eval_loader(train_ds, batch_size=max(args.batch_size, 128), num_workers=args.num_workers)
+    train_ref_loader = build_eval_loader(gallery_ds, batch_size=max(args.batch_size, 128), num_workers=args.num_workers)
     val_loader       = build_eval_loader(val_ds, batch_size=max(args.batch_size, 128), num_workers=args.num_workers)
 
     # Model / loss / optimizer
@@ -202,7 +214,7 @@ def main() -> None:
     best_epoch = 0
     epochs_since_best = 0
 
-    print(f"[run {run_name}] device={device} | mode={args.split_mode} | train={len(train_ds)} val={len(val_ds)} | loss={args.loss}")
+    print(f"[run {run_name}] device={device} | mode={args.split_mode} | train={len(train_ds)} val={len(val_ds)} | loss={args.loss} | aug={use_aug}")
     if device.type == "cuda":
         # Confirm the model + a sample batch actually land on the GPU.
         _x, _y = next(iter(train_loader))
@@ -213,6 +225,7 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
+        train_ds.set_epoch(epoch)  # drives the optional augmentation curriculum
         train_loss = train_one_epoch(model, train_loader, loss_fn, miner, optimizer, device)
         scheduler.step()
         metrics = eval_one_epoch(model, val_loader, train_ref_loader, loss_fn, miner, device)

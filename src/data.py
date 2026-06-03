@@ -383,31 +383,79 @@ def preprocess_spectra(intensities: np.ndarray) -> torch.Tensor:
 
 
 class SpectrumDataset(Dataset):
-    """In-memory dataset of preprocessed FTIR spectra.
+    """In-memory dataset of FTIR spectra.
 
-    The full corpus is ~3k spectra of 882 floats each (~11 MB), so we
-    pre-normalize and pre-pad once at construction. `__getitem__` is then
-    a pure tensor slice.
+    The full corpus is ~3k spectra of 882 floats each (~11 MB), held in
+    memory. With `augment=False` the normalized+padded tensor is precomputed
+    once and `__getitem__` is a pure slice. With `augment=True` the raw
+    absorbance is kept and each `__getitem__` applies physics-based
+    augmentation (src.augment.Augmenter) *before* the shared
+    `preprocess_spectra`, so perturbations vary per epoch.
+
+    Augmentation is for the TRAINING loader only. Evaluation, the k-NN
+    gallery pass, and inference must use `augment=False` so the honest
+    signal and the class prototypes stay clean.
     """
 
-    def __init__(self, df: pd.DataFrame, split_ids: Iterable[str]) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        split_ids: Iterable[str],
+        augment: bool = False,
+        aug_seed: int | None = None,
+    ) -> None:
         split_id_set = set(split_ids)
         view = df[df["spectrum_id"].isin(split_id_set)].reset_index(drop=True)
         if view.empty:
             raise ValueError("SpectrumDataset received an empty split")
 
-        intensities = np.stack(view["intensity"].to_numpy()).astype(np.float32)
-        self.X = preprocess_spectra(intensities)
+        # Raw absorbance on the canonical 882 grid (augmenter input).
+        self.A = np.stack(view["intensity"].to_numpy()).astype(np.float32)
         self.y = torch.tensor(
             [CLASS_TO_IDX[c] for c in view["polymer_class_raw"]], dtype=torch.long
         )
         self.spectrum_ids: list[str] = view["spectrum_id"].tolist()
 
+        self.augment = augment
+        if augment:
+            from src.augment import Augmenter
+            self.augmenter = Augmenter(rng=np.random.default_rng(aug_seed))
+            self.X = None  # computed on the fly
+        else:
+            # Fast path: precompute the clean normalized+padded tensor.
+            self.X = preprocess_spectra(self.A)
+
     def __len__(self) -> int:
-        return self.X.shape[0]
+        return self.A.shape[0]
+
+    def set_epoch(self, epoch: int) -> None:
+        """Forward the epoch to the augmenter (for the optional curriculum)."""
+        if self.augment:
+            self.augmenter.set_epoch(epoch)
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.X[i], self.y[i]
+        if self.augment:
+            a = self.augmenter(self.A[i])
+            x = preprocess_spectra(a[None])[0]
+        else:
+            x = self.X[i]
+        return x, self.y[i]
+
+
+def aug_worker_init_fn(worker_id: int) -> None:
+    """Give each DataLoader worker an independent augmenter RNG stream.
+
+    Without this, forked workers share the parent's Generator state and
+    silently repeat identical perturbations. With the default num_workers=0
+    this is a no-op, but it keeps augmentation correct if workers are added.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    ds = info.dataset
+    if getattr(ds, "augment", False):
+        base = torch.initial_seed() % (2**32)
+        ds.augmenter.reseed(base + worker_id)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +496,7 @@ def build_train_loader_pairmining(
         num_workers=num_workers,
         drop_last=True,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=aug_worker_init_fn if num_workers > 0 else None,
     )
 
 
@@ -464,6 +513,7 @@ def build_shuffled_loader(
         num_workers=num_workers,
         drop_last=False,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=aug_worker_init_fn if num_workers > 0 else None,
     )
 
 

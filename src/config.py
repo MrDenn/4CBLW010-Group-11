@@ -84,3 +84,20 @@ SPLIT_FRACTIONS = {"train": 0.70, "val": 0.10, "calib": 0.10, "test": 0.10}
 
 # Default seed used wherever reproducibility matters. Override per run.
 DEFAULT_SEED = 42
+
+# On-the-fly physics-based augmentation (training split only). See
+# src/augment.py and research-notes/augmentation_implementation_report.md.
+# Every transform is wavenumber-dependent or per-channel: per-spectrum
+# min/max normalization downstream cancels pure offsets and global scales,
+# so those are deliberately absent. Axis transforms (wn_shift, broaden) are
+# kept mild to avoid erasing the narrow HDPE<->LDPE discriminators.
+AUG = {
+    "enabled": True,
+    "p_each": 0.7,                                                  # per-transform fire probability
+    "mult_field":  {"c1": (-0.6, 0.6), "c2": (-0.3, 0.3), "clip": (0.5, 1.8)},  # 4.1 penetration tilt + scatter
+    "add_baseline": {"beta": (0.01, 0.08), "order": 2},            # 4.2 sloped/curved baseline (1-8% of range)
+    "noise":       {"rho": (0.005, 0.02)},                         # 4.3 Gaussian noise (0.5-2% of max)
+    "wn_shift":    {"channels": (-1.0, 1.0)},                      # 4.4 PE-risky; widen to (-2,2) only if PE holds
+    "broaden":     {"sigma_ch": (0.0, 1.0)},                       # 4.5 PE-risky; keep <=1 channel
+    "curriculum_warmup_epochs": 0,                                 # set ~10 if early epochs unstable
+}
