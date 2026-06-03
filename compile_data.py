@@ -197,14 +197,72 @@ def load_openspecy(directory: str) -> list[dict]:
     return records
 
 
+def load_inhouse(directory: str, source_label: str = "In-house") -> list[dict]:
+    """In-house lab ATR-FTIR: JCAMP-style .txt (## header, then wn  %T).
+
+    Physical-sample identity comes from the ``##TITLE=`` header: spectra
+    whose TITLE matches exactly are replicate measurements of the same
+    physical sample (e.g. three shots of one bottle cap). The
+    physical_sample_id is keyed on (class, title) rather than title alone,
+    so an observed cross-class TITLE collision (a "Party Cup PS" file filed
+    under PET) cannot merge two different materials into one group.
+    """
+    records = []
+    for f in sorted(Path(directory).glob("*.txt")):
+        polymer_raw = re.split(r"[ _\-.]", f.stem)[0].upper()
+
+        title = None
+        y_units = "UNKNOWN"
+        wn, y = [], []
+        for line in f.read_text(errors="ignore").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("##"):
+                up = s.upper()
+                if up.startswith("##TITLE="):
+                    title = s.split("=", 1)[1].strip()
+                elif up.startswith("##YUNITS="):
+                    y_units = s.split("=", 1)[1].strip().upper()
+                continue
+            parts = s.replace(",", " ").split()
+            if len(parts) >= 2:
+                try:
+                    wn.append(float(parts[0])); y.append(float(parts[1]))
+                except ValueError:
+                    continue
+        if len(wn) < 50:
+            continue
+        wn = np.asarray(wn, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        intensity = pct_T_to_absorbance(y) if "T" in y_units else y
+        title = title or f.stem
+
+        records.append({
+            "spectrum_id":        f"{source_label}_{f.stem}",
+            "source":             source_label,
+            "sample_id":          f.stem,
+            "polymer_class_raw":  polymer_raw,
+            "physical_sample_id": f"{source_label}::{polymer_raw}::{title}",
+            "wn":                 wn,
+            "intensity":          intensity,
+            "intensity_type":     "absorbance",
+            "resolution_cm":      4.0,
+            "instrument_mode":    "ATR",
+        })
+    return records
+
+
 flopp   = load_flopp("data/raw/FLOPP/",   "FLOPP")
 flopp_e = load_flopp("data/raw/FLOPP-e/", "FLOPP-e")
 vc_c4   = load_villegas_c4("data/raw/Villegas-FTIR-Plastics/")
 os_recs = load_openspecy("data/raw/OpenSpecy/")
+inhouse = load_inhouse("data/raw/Lab Combined/")
 print(f"FLOPP    loaded: {len(flopp)} files")
 print(f"FLOPP-e  loaded: {len(flopp_e)} files")
 print(f"VC-c4    loaded: {len(vc_c4)} files")
 print(f"OpenSpecy loaded: {len(os_recs)} spectra")
+print(f"In-house loaded: {len(inhouse)} spectra")
 
 
 CANONICAL_LO, CANONICAL_HI, CANONICAL_N = 700.0, 3996.0, 882
@@ -227,7 +285,7 @@ def resample(wn_native, y_native):
     return f(canonical_wn).astype(np.float32)
 
 
-all_records = flopp + flopp_e + vc_c4 + os_recs
+all_records = flopp + flopp_e + vc_c4 + os_recs + inhouse
 
 rows = []
 for r in all_records:
@@ -237,14 +295,18 @@ for r in all_records:
     if y_canon is None:
         continue
     rows.append({
-        "spectrum_id":       r["spectrum_id"],
-        "source":            r["source"],
-        "sample_id":         r["sample_id"],
-        "polymer_class_raw": r["polymer_class_raw"],
-        "intensity_type":    r["intensity_type"],
-        "instrument_mode":   r.get("instrument_mode"),
-        "resolution_cm":     r.get("resolution_cm"),
-        "intensity":         y_canon.tolist(),  # length 882
+        "spectrum_id":        r["spectrum_id"],
+        "source":             r["source"],
+        "sample_id":          r["sample_id"],
+        "polymer_class_raw":  r["polymer_class_raw"],
+        # Per-particle identity for leak-free, group-aware splitting. Loaders
+        # that track replicates (e.g. in-house via TITLE) set this; others
+        # default to one physical sample per spectrum.
+        "physical_sample_id": r.get("physical_sample_id") or f"{r['source']}::{r['sample_id']}",
+        "intensity_type":     r["intensity_type"],
+        "instrument_mode":    r.get("instrument_mode"),
+        "resolution_cm":      r.get("resolution_cm"),
+        "intensity":          y_canon.tolist(),  # length 882
     })
 
 df = pd.DataFrame(rows)

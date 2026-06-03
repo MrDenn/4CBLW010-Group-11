@@ -27,6 +27,29 @@ def splits_path(mode: str) -> Path:
 SOURCE_OUT_TRAIN: tuple[str, ...] = ("Villegas-c4", "FLOPP")
 SOURCE_OUT_TEST:  tuple[str, ...] = ("FLOPP-e", "OpenSpecy")
 
+# source_cv split: a cross-source validation signal without saturating on
+# Villegas. Construction:
+#   - val: a BALANCED per-class quota of physical samples drawn from the
+#     non-Villegas pool, taking each class from whichever source has the
+#     most of it (minimizes test damage), capped so no single source loses
+#     more than VAL_MAX_SHARE of its samples of a class (avoids draining a
+#     thin source). This keeps OpenSpecy — our only 6-class cross-lab test —
+#     almost entirely intact.
+#   - train: Villegas + FLOPP (backbone) + the in-house non-val remainder's
+#     train portion (injects deployment-instrument structure), minus a calib
+#     carve from the backbone.
+#   - test: in-house non-val remainder's test portion (test_In-house) +
+#     FLOPP-e and OpenSpecy non-val remainders (test_<source>).
+# Caveat: any source a class is drawn into val from has a mildly optimistic
+# (selection-biased) test number for that class; the quota is kept small to
+# bound this.
+SOURCE_CV_TRAIN: tuple[str, ...]      = ("Villegas-c4", "FLOPP")   # backbone -> train (+ calib)
+SOURCE_CV_VAL_SOURCES: tuple[str, ...] = ("In-house", "FLOPP-e", "OpenSpecy")  # val drawn from these
+SOURCE_CV_VAL_QUOTA: int               = 5      # target physical samples per class in val
+SOURCE_CV_VAL_MAX_SHARE: float         = 0.5    # never take >this share of a source's samples of a class
+SOURCE_CV_INHOUSE_TEST_FRAC: float     = 0.34   # in-house non-val remainder: this -> test, rest -> train
+SOURCE_CV_TEST: tuple[str, ...]        = ("FLOPP-e", "OpenSpecy")  # non-val remainder -> locked test
+
 # Class vocabulary. Fixed alphabetical order so that label indices are
 # stable across runs and saved checkpoints remain compatible.
 POLYMER_CLASSES: tuple[str, ...] = ("HDPE", "LDPE", "PET", "PP", "PS", "PVC")

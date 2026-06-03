@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--split-mode", choices=("random", "source_out"), default="random")
+    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv"), default="random")
     p.add_argument("--refresh-splits", action="store_true")
     return p.parse_args()
 

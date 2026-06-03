@@ -34,6 +34,12 @@ from src.config import (
     PAD_RIGHT,
     PARQUET_PATH,
     POLYMER_CLASSES,
+    SOURCE_CV_INHOUSE_TEST_FRAC,
+    SOURCE_CV_TEST,
+    SOURCE_CV_TRAIN,
+    SOURCE_CV_VAL_MAX_SHARE,
+    SOURCE_CV_VAL_QUOTA,
+    SOURCE_CV_VAL_SOURCES,
     SOURCE_OUT_TEST,
     SOURCE_OUT_TRAIN,
     splits_path,
@@ -41,7 +47,7 @@ from src.config import (
 from src.utils import read_json, write_json
 
 
-SplitMode = Literal["random", "source_out"]
+SplitMode = Literal["random", "source_out", "source_cv"]
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +57,16 @@ SplitMode = Literal["random", "source_out"]
 
 def load_parquet(path: Path | str = PARQUET_PATH) -> pd.DataFrame:
     """Load the harmonized parquet, filter to the 6 target classes, and
-    attach a `physical_sample_id` column used for group-aware splitting.
+    ensure a `physical_sample_id` column for group-aware splitting.
+
+    compile_data.py now writes physical_sample_id directly (loaders that
+    track replicates, e.g. in-house via TITLE, set it authoritatively). The
+    regex fallback only runs for older parquets that predate that column.
     """
     df = pd.read_parquet(path)
     df = df[df["polymer_class_raw"].isin(POLYMER_CLASSES)].reset_index(drop=True)
-    df["physical_sample_id"] = derive_physical_sample_id(df)
+    if "physical_sample_id" not in df.columns:
+        df["physical_sample_id"] = derive_physical_sample_id(df)
     return df
 
 
@@ -90,11 +101,16 @@ def make_splits(df: pd.DataFrame, seed: int, mode: SplitMode) -> dict[str, str]:
                       sources only; one held-out test split per source in
                       SOURCE_OUT_TEST (e.g. test_floppe-e, test_openspecy)
                       so per-source generalization is measurable.
+      - "source_cv":  like source_out, but SOURCE_CV_MIXED sources (in-house)
+                      are split BY PHYSICAL SAMPLE into train / val / test, so
+                      val is a non-degenerate *cross-source* selection signal.
     """
     if mode == "random":
         assignment = _make_splits_random(df, seed)
     elif mode == "source_out":
         assignment = _make_splits_source_out(df, seed)
+    elif mode == "source_cv":
+        assignment = _make_splits_source_cv(df, seed)
     else:
         raise ValueError(f"Unknown split mode: {mode!r}")
     _assert_no_group_leakage(df, assignment)
@@ -160,6 +176,126 @@ def _make_splits_source_out(df: pd.DataFrame, seed: int) -> dict[str, str]:
         pieces.append((src_idx, f"test_{src}"))
 
     return _build_assignment(df, pieces)
+
+
+def _make_splits_source_cv(df: pd.DataFrame, seed: int) -> dict[str, str]:
+    """source_cv: balanced cross-source val + locked per-source test.
+
+    1. val   = balanced per-class quota of physical samples drawn from the
+               non-Villegas pool (most-abundant source first, capped per
+               source) — see _select_val_samples.
+    2. train = Villegas + FLOPP backbone (minus a calib carve) + the
+               in-house non-val remainder's train portion.
+    3. test  = in-house non-val remainder's test portion (test_In-house) +
+               FLOPP-e / OpenSpecy non-val remainders (test_<source>).
+    """
+    src = df["source"].to_numpy()
+    pieces: list[tuple[np.ndarray, str]] = []
+
+    # 1. Balanced cross-source val (by physical sample).
+    val_samples = _select_val_samples(df, seed)
+    not_val = ~df["physical_sample_id"].isin(val_samples).to_numpy()
+    pieces.append((np.where(df["physical_sample_id"].isin(val_samples).to_numpy())[0], "val"))
+
+    # 2. In-house non-val remainder -> train / test_In-house (by sample).
+    ih_mask = (src == "In-house") & not_val
+    if ih_mask.any():
+        ih_assign = _assign_train_test_by_sample(df[ih_mask], SOURCE_CV_INHOUSE_TEST_FRAC, seed)
+        for portion, split_name in (("train", "train"), ("test", "test_In-house")):
+            ids = {sid for sid, p in ih_assign.items() if p == portion}
+            if ids:
+                pieces.append((np.where(df["spectrum_id"].isin(ids).to_numpy())[0], split_name))
+
+    # 3. FLOPP-e / OpenSpecy non-val remainder -> locked test.
+    for source in SOURCE_CV_TEST:
+        idx = np.where((src == source) & not_val)[0]
+        if idx.size:
+            pieces.append((idx, f"test_{source}"))
+
+    # 4. Villegas + FLOPP backbone -> train, with a ~10% by-sample calib carve.
+    pool_mask = df["source"].isin(SOURCE_CV_TRAIN).to_numpy()
+    if not pool_mask.any():
+        raise ValueError(
+            f"No spectra for any source in SOURCE_CV_TRAIN={SOURCE_CV_TRAIN}. "
+            f"Available: {sorted(df['source'].unique())}"
+        )
+    pool_idx = np.where(pool_mask)[0]
+    pool_df = df[pool_mask]
+    calib_local = _peel(np.arange(len(pool_df)),
+                        pool_df["polymer_class_raw"].to_numpy(),
+                        pool_df["physical_sample_id"].to_numpy(),
+                        n_splits=10, seed=seed)
+    calib_idx = pool_idx[calib_local]
+    pieces.append((np.setdiff1d(pool_idx, calib_idx, assume_unique=False), "train"))
+    pieces.append((calib_idx, "calib"))
+
+    return _build_assignment(df, pieces)
+
+
+def _select_val_samples(df: pd.DataFrame, seed: int) -> set[str]:
+    """Pick a balanced per-class set of physical_sample_ids for val.
+
+    For each class, draw up to SOURCE_CV_VAL_QUOTA physical samples from the
+    SOURCE_CV_VAL_SOURCES pool, taking from the source with the most samples
+    of that class first, but never more than SOURCE_CV_VAL_MAX_SHARE of any
+    one source's samples of that class (so a thin source is never drained).
+    A relaxed second pass lifts the cap only if the quota cannot otherwise
+    be met.
+    """
+    rng = np.random.default_rng(seed)
+    pool = df[df["source"].isin(SOURCE_CV_VAL_SOURCES)]
+    chosen: set[str] = set()
+
+    for cls in sorted(pool["polymer_class_raw"].unique()):
+        cls_df = pool[pool["polymer_class_raw"] == cls]
+        # source -> list of its physical samples for this class, shuffled.
+        by_src: dict[str, list[str]] = {}
+        for source, sdf in cls_df.groupby("source"):
+            samples = list(pd.unique(sdf["physical_sample_id"]))
+            rng.shuffle(samples)
+            by_src[source] = samples
+        order = sorted(by_src, key=lambda s: len(by_src[s]), reverse=True)
+
+        picked: list[str] = []
+        # Capped pass: at most MAX_SHARE of each source's class samples.
+        for source in order:
+            if len(picked) >= SOURCE_CV_VAL_QUOTA:
+                break
+            cap = max(1, int(len(by_src[source]) * SOURCE_CV_VAL_MAX_SHARE))
+            take = min(SOURCE_CV_VAL_QUOTA - len(picked), cap)
+            picked.extend(by_src[source][:take])
+        # Relaxed pass: only if still short of quota, draw remaining ignoring cap.
+        if len(picked) < SOURCE_CV_VAL_QUOTA:
+            already = set(picked)
+            for source in order:
+                for psid in by_src[source]:
+                    if len(picked) >= SOURCE_CV_VAL_QUOTA:
+                        break
+                    if psid not in already:
+                        picked.append(psid)
+        chosen.update(picked)
+
+    return chosen
+
+
+def _assign_train_test_by_sample(
+    sub: pd.DataFrame, test_frac: float, seed: int,
+) -> dict[str, str]:
+    """Split `sub` into 'train'/'test' by physical sample, per class,
+    keeping replicates together and guaranteeing >=1 train sample."""
+    rng = np.random.default_rng(seed)
+    out: dict[str, str] = {}
+    for _, cdf in sub.groupby("polymer_class_raw"):
+        samples = list(pd.unique(cdf["physical_sample_id"]))
+        rng.shuffle(samples)
+        n = len(samples)
+        n_te = max(1, round(test_frac * n)) if n >= 2 else 0
+        if n - n_te < 1:
+            n_te = max(0, n - 1)
+        test_s = set(samples[:n_te])
+        for sid, psid in zip(cdf["spectrum_id"], cdf["physical_sample_id"]):
+            out[sid] = "test" if psid in test_s else "train"
+    return out
 
 
 def _peel(idx: np.ndarray, y: np.ndarray, g: np.ndarray, n_splits: int, seed: int) -> np.ndarray:

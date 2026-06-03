@@ -234,7 +234,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--samples", required=True, help="Folder of .txt spectra")
     p.add_argument("--embedder-run", required=True, help="Run name under runs/")
     p.add_argument("--checkpoint", default="best.pt")
-    p.add_argument("--split-mode", choices=("random", "source_out"), default="random",
+    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv"), default="random",
                    help="Which training split supplies the k-NN gallery "
                         "(use the mode the embedder was trained with).")
     p.add_argument("--k", type=int, default=5, help="k-NN neighbours")

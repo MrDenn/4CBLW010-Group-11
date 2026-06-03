@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--embedder-run", required=True)
     p.add_argument("--checkpoint", default="best.pt")
     p.add_argument("--unknown-class", required=True, choices=POLYMER_CLASSES)
-    p.add_argument("--split-mode", choices=("random", "source_out"), default="random")
+    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv"), default="random")
     p.add_argument("--alpha", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()

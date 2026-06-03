@@ -1,3 +1,5 @@
 /data/raw/
+/research-notes/
 /.venv/
 /.idea/
+/runs/
