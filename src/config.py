@@ -50,6 +50,30 @@ SOURCE_CV_VAL_MAX_SHARE: float         = 0.5    # never take >this share of a so
 SOURCE_CV_INHOUSE_TEST_FRAC: float     = 0.34   # in-house non-val remainder: this -> test, rest -> train
 SOURCE_CV_TEST: tuple[str, ...]        = ("FLOPP-e", "OpenSpecy")  # non-val remainder -> locked test
 
+# source_cv2 split: the multi-instrument, full-corpus protocol. Trains on
+# FIVE instruments so the encoder can learn instrument-invariance rather than
+# one instrument's fingerprint, and tests on whole held-out instruments for an
+# honest hardware-agnostic number with a large (tight-CI) pooled test set.
+#   - train: Villegas + Cowger + Poseidon + FLOPP (backbone) + the in-house
+#     non-val/non-test remainder. Cowger uniquely adds explicit HDPE/LDPE on a
+#     second instrument — the best lever for the hardest (PE-vs-PE) error.
+#   - val: a BALANCED per-class quota of physical samples drawn ROUND-ROBIN
+#     across the held-in sources (so the selection signal is multi-instrument,
+#     not just the tiny in-house set), capped per source so none is drained.
+#   - test (locked, whole-instrument, never trained): OpenSpecy (multi-lab),
+#     FLOPP-e (weathered), Baskaran (food-packaging multilayer), plus the
+#     in-house test slice (deployment instrument).
+# Note: Poseidon contributes a single noisy marine PVC spectrum to train; it
+# is harmless and left in. PVC remains a near-Villegas monoculture in training
+# (almost no non-Villegas PVC exists), so PVC cross-hardware stays the weakest.
+SOURCE_CV2_TRAIN: tuple[str, ...]       = ("Villegas-c4", "Cowger", "Poseidon", "FLOPP")  # -> train (+calib)
+SOURCE_CV2_MIXED: str                  = "In-house"   # split by sample: train + locked test slice
+SOURCE_CV2_TEST: tuple[str, ...]       = ("OpenSpecy", "FLOPP-e", "Baskaran")  # locked whole-instrument test
+SOURCE_CV2_VAL_SOURCES: tuple[str, ...] = ("Villegas-c4", "Cowger", "Poseidon", "FLOPP", "In-house")  # held-in; val drawn round-robin from these
+SOURCE_CV2_VAL_QUOTA: int              = 8      # target physical samples per class in val
+SOURCE_CV2_VAL_MAX_SHARE: float        = 0.5    # never take >this share of a source's samples of a class
+SOURCE_CV2_INHOUSE_TEST_FRAC: float    = 0.34   # in-house non-val remainder: this -> test, rest -> train
+
 # Class vocabulary. Fixed alphabetical order so that label indices are
 # stable across runs and saved checkpoints remain compatible.
 POLYMER_CLASSES: tuple[str, ...] = ("HDPE", "LDPE", "PET", "PP", "PS", "PVC")

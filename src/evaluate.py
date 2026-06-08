@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--embedder-run", required=True, help="Run name under runs/ for the embedder")
     p.add_argument("--classifier-run", default=None, help="Optional run name for the CE classifier baseline")
     p.add_argument("--checkpoint", default="best.pt", help="Filename inside the run dir (default best.pt)")
-    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv"), default="random",
+    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv", "source_cv2"), default="random",
                    help="Must match the split mode the embedder was trained with.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()

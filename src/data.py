@@ -40,6 +40,13 @@ from src.config import (
     SOURCE_CV_VAL_MAX_SHARE,
     SOURCE_CV_VAL_QUOTA,
     SOURCE_CV_VAL_SOURCES,
+    SOURCE_CV2_INHOUSE_TEST_FRAC,
+    SOURCE_CV2_MIXED,
+    SOURCE_CV2_TEST,
+    SOURCE_CV2_TRAIN,
+    SOURCE_CV2_VAL_MAX_SHARE,
+    SOURCE_CV2_VAL_QUOTA,
+    SOURCE_CV2_VAL_SOURCES,
     SOURCE_OUT_TEST,
     SOURCE_OUT_TRAIN,
     splits_path,
@@ -47,7 +54,7 @@ from src.config import (
 from src.utils import read_json, write_json
 
 
-SplitMode = Literal["random", "source_out", "source_cv"]
+SplitMode = Literal["random", "source_out", "source_cv", "source_cv2"]
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +108,14 @@ def make_splits(df: pd.DataFrame, seed: int, mode: SplitMode) -> dict[str, str]:
                       sources only; one held-out test split per source in
                       SOURCE_OUT_TEST (e.g. test_floppe-e, test_openspecy)
                       so per-source generalization is measurable.
-      - "source_cv":  like source_out, but SOURCE_CV_MIXED sources (in-house)
-                      are split BY PHYSICAL SAMPLE into train / val / test, so
-                      val is a non-degenerate *cross-source* selection signal.
+      - "source_cv":  like source_out, but the in-house source is split BY
+                      PHYSICAL SAMPLE into train / val / test, so val is a
+                      non-degenerate *cross-source* selection signal.
+      - "source_cv2": multi-instrument full-corpus protocol. Trains on five
+                      instruments (Villegas+Cowger+Poseidon+FLOPP+in-house
+                      slice), validates on a balanced round-robin draw across
+                      those held-in sources, and tests on whole held-out
+                      instruments (OpenSpecy, FLOPP-e, Baskaran, in-house slice).
     """
     if mode == "random":
         assignment = _make_splits_random(df, seed)
@@ -111,6 +123,8 @@ def make_splits(df: pd.DataFrame, seed: int, mode: SplitMode) -> dict[str, str]:
         assignment = _make_splits_source_out(df, seed)
     elif mode == "source_cv":
         assignment = _make_splits_source_cv(df, seed)
+    elif mode == "source_cv2":
+        assignment = _make_splits_source_cv2(df, seed)
     else:
         raise ValueError(f"Unknown split mode: {mode!r}")
     _assert_no_group_leakage(df, assignment)
@@ -273,6 +287,115 @@ def _select_val_samples(df: pd.DataFrame, seed: int) -> set[str]:
                         break
                     if psid not in already:
                         picked.append(psid)
+        chosen.update(picked)
+
+    return chosen
+
+
+def _make_splits_source_cv2(df: pd.DataFrame, seed: int) -> dict[str, str]:
+    """source_cv2: multi-instrument training + whole-instrument held-out test.
+
+    1. val   = balanced per-class quota of physical samples drawn ROUND-ROBIN
+               across the held-in sources (multi-instrument selection signal),
+               see _select_val_samples_roundrobin.
+    2. train = SOURCE_CV2_TRAIN backbone (Villegas+Cowger+Poseidon+FLOPP) minus
+               val and a calib carve, plus the in-house non-val/non-test slice.
+    3. test  = in-house test slice (test_In-house) + each SOURCE_CV2_TEST source
+               held out whole (test_OpenSpecy / test_FLOPP-e / test_Baskaran).
+    """
+    src = df["source"].to_numpy()
+    pieces: list[tuple[np.ndarray, str]] = []
+
+    # 1. Multi-instrument val (by physical sample, round-robin across held-in).
+    val_samples = _select_val_samples_roundrobin(
+        df, SOURCE_CV2_VAL_SOURCES, SOURCE_CV2_VAL_QUOTA, SOURCE_CV2_VAL_MAX_SHARE, seed
+    )
+    in_val = df["physical_sample_id"].isin(val_samples).to_numpy()
+    not_val = ~in_val
+    pieces.append((np.where(in_val)[0], "val"))
+
+    # 2. In-house non-val remainder -> train / test_In-house (by sample).
+    ih_mask = (src == SOURCE_CV2_MIXED) & not_val
+    if ih_mask.any():
+        ih_assign = _assign_train_test_by_sample(df[ih_mask], SOURCE_CV2_INHOUSE_TEST_FRAC, seed)
+        for portion, split_name in (("train", "train"), ("test", "test_In-house")):
+            ids = {sid for sid, p in ih_assign.items() if p == portion}
+            if ids:
+                pieces.append((np.where(df["spectrum_id"].isin(ids).to_numpy())[0], split_name))
+
+    # 3. Locked whole-instrument test sources (val never draws from these).
+    for source in SOURCE_CV2_TEST:
+        idx = np.where(src == source)[0]
+        if idx.size:
+            pieces.append((idx, f"test_{source}"))
+
+    # 4. Backbone train pool (non-val) -> train, with a ~10% by-sample calib carve.
+    pool_mask = df["source"].isin(SOURCE_CV2_TRAIN).to_numpy() & not_val
+    if not pool_mask.any():
+        raise ValueError(
+            f"No spectra for any source in SOURCE_CV2_TRAIN={SOURCE_CV2_TRAIN}. "
+            f"Available: {sorted(df['source'].unique())}"
+        )
+    pool_idx = np.where(pool_mask)[0]
+    pool_df = df.iloc[pool_idx]
+    calib_local = _peel(np.arange(len(pool_df)),
+                        pool_df["polymer_class_raw"].to_numpy(),
+                        pool_df["physical_sample_id"].to_numpy(),
+                        n_splits=10, seed=seed)
+    calib_idx = pool_idx[calib_local]
+    pieces.append((np.setdiff1d(pool_idx, calib_idx, assume_unique=False), "train"))
+    pieces.append((calib_idx, "calib"))
+
+    return _build_assignment(df, pieces)
+
+
+def _select_val_samples_roundrobin(
+    df: pd.DataFrame, sources: tuple[str, ...], quota: int, max_share: float, seed: int,
+) -> set[str]:
+    """Pick a balanced per-class val set, drawn ROUND-ROBIN across `sources`.
+
+    For each class we cycle through the available held-in sources taking one
+    physical sample at a time, so the val set is spread across instruments
+    rather than dominated by the largest (Villegas). No source contributes
+    more than `max_share` of its samples of a class on the capped pass; a
+    relaxed pass lifts the cap only if the quota still can't be met.
+    """
+    rng = np.random.default_rng(seed)
+    pool = df[df["source"].isin(sources)]
+    chosen: set[str] = set()
+
+    for cls in sorted(pool["polymer_class_raw"].unique()):
+        cls_df = pool[pool["polymer_class_raw"] == cls]
+        by_src: dict[str, list[str]] = {}
+        cap: dict[str, int] = {}
+        for source, sdf in cls_df.groupby("source"):
+            samples = list(pd.unique(sdf["physical_sample_id"]))
+            rng.shuffle(samples)
+            by_src[source] = samples
+            cap[source] = max(1, int(len(samples) * max_share))
+        order = sorted(by_src)  # deterministic round-robin order
+        taken = {s: 0 for s in by_src}
+        picked: list[str] = []
+
+        # Capped round-robin pass.
+        progressed = True
+        while len(picked) < quota and progressed:
+            progressed = False
+            for source in order:
+                if len(picked) >= quota:
+                    break
+                if taken[source] < min(cap[source], len(by_src[source])):
+                    picked.append(by_src[source][taken[source]])
+                    taken[source] += 1
+                    progressed = True
+
+        # Relaxed pass (ignore the per-source cap) only if still short.
+        if len(picked) < quota:
+            for source in order:
+                while taken[source] < len(by_src[source]) and len(picked) < quota:
+                    picked.append(by_src[source][taken[source]])
+                    taken[source] += 1
+
         chosen.update(picked)
 
     return chosen

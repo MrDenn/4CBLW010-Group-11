@@ -66,7 +66,7 @@ def _embed_txt_folder(model, folder: Path, device) -> tuple[np.ndarray, np.ndarr
 def main() -> None:
     p = argparse.ArgumentParser(description="Combined evaluation across all test sources.")
     p.add_argument("--embedder-run", required=True)
-    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv"), default="source_out")
+    p.add_argument("--split-mode", choices=("random", "source_out", "source_cv", "source_cv2"), default="source_out")
     p.add_argument("--checkpoint", default="best.pt")
     p.add_argument("--samples", action="append", default=[],
                    help="Folder of labelled .txt spectra (repeatable).")
