@@ -502,15 +502,27 @@ def load_food_packaging(directory: Path, labels_csv: Path) -> list[dict]:
     (XLabel/YLabel/FileType/DisplayDirection/PeakDirection), one per separated
     film layer. The files carry no material labels; labels.csv (shipped beside
     the data) maps each filename -> polymer using Table 1 of the paper:
-      PP / PET / LDPE (PE family collapsed; m- metalized resins kept) as big-6
-      knowns, Polyurethane as an open-set foreign. Rows whose `material` is
-      blank (the SBR and EVA singletons, which resemble big-6 PS/PP and PE) are
-      skipped entirely. Small n -> intended as eval / open-set material, not
-      training. See research-notes/datasets_and_integration.md.
+      PP / PET / LDPE (PE family collapsed) as big-6 knowns, Polyurethane as an
+      open-set foreign. Rows whose `material` is blank (the SBR and EVA
+      singletons, which resemble big-6 PS/PP and PE) are skipped entirely.
+
+      Reliability filter (2026-06-09): big-6 layers flagged in `note` as
+      **metalized** (m-PET / m-PP / m-LDPE — partly aluminium, footnote "m-" in
+      the paper's Table 1) or **littered/degraded (oxidized)** (the dumpsite
+      "L MLPF" packs the paper studies for photo-oxidation) are excluded from
+      the known pool: a part-metal or weathered layer is not a reliable pure-
+      polymer reference and should not be scored as a clean big-6 plastic. The
+      raw CSVs + labels.csv preserve them, so this is reversible. Open-set PUR
+      layers are kept regardless (a degraded unknown is still a valid unknown).
+      Small n -> intended as eval / open-set material, not training. See
+      research-notes/datasets_and_integration.md.
     """
     labels = pd.read_csv(labels_csv)
     material_by_file = {str(r["filename"]): str(r["material"]).strip()
                         for _, r in labels.iterrows()}
+    note_by_file = {str(r["filename"]): str(r.get("note", "")).lower()
+                    for _, r in labels.iterrows()}
+    _BIG6 = {"HDPE", "LDPE", "PET", "PP", "PS", "PVC"}
     records = []
     for f in sorted(directory.glob("*.csv")):
         if f.name == labels_csv.name:
@@ -518,6 +530,9 @@ def load_food_packaging(directory: Path, labels_csv: Path) -> list[dict]:
         material = material_by_file.get(f.name, "")
         if not material or material.lower() == "nan":
             continue  # unlabelled or deliberately excluded (SBR / EVA)
+        note = note_by_file.get(f.name, "")
+        if material in _BIG6 and ("metaliz" in note or "littered" in note or "degraded" in note):
+            continue  # metalized / degraded big-6 layer: not a reliable reference
         df = _read_two_col_csv(f)  # skip header, take first 2 cols (wn, %T)
         if df is None:
             continue
